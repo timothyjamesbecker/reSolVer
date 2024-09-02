@@ -1,0 +1,3 @@
+readgroup:H06HD.1	platform:illumina	map:/data/g1kp3_run/NA12878.bam	readlen:242.99	lib:Solexa-135852	num:10001	lower:0.00	upper:1074.52	mean:409.11	std:152.48	SWnormality:-28.52	exe:samtools view
+readgroup:H06JU.1	platform:illumina	map:/data/g1kp3_run/NA12878.bam	readlen:242.99	lib:Solexa-135852	num:10001	lower:0.00	upper:1074.52	mean:409.11	std:152.48	SWnormality:-28.52	exe:samtools view
+readgroup:H06HD.2	platform:illumina	map:/data/g1kp3_run/NA12878.bam	readlen:242.99	lib:Solexa-135852	num:10001	lower:0.00	upper:1074.52	mean:409.11	std:152.48	SWnormality:-28.52	exe:samtools view

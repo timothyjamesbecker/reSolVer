@@ -1,0 +1,1 @@
+readgroup:NA19238RG	platform:illumina	map:/home/tbecker/g1kp3_run/NA19238.bam	readlen:248.08	lib:NA19238RG	num:9998	lower:9.57	upper:1211.05	mean:574.76	std:150.03	SWnormality:-25.41	exe:samtools view

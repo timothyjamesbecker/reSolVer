@@ -1,0 +1,2 @@
+readgroup:H7A1W.1	platform:illumina	map:/home/tbecker/g1kp3_run/NA20502.bam	readlen:247.60	lib:Solexa-206009	num:10001	lower:22.53	upper:991.84	mean:460.07	std:120.86	SWnormality:-29.25	exe:samtools view
+readgroup:H7A1W.2	platform:illumina	map:/home/tbecker/g1kp3_run/NA20502.bam	readlen:247.60	lib:Solexa-206009	num:10001	lower:22.53	upper:991.84	mean:460.07	std:120.86	SWnormality:-29.25	exe:samtools view
