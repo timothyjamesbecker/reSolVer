@@ -8,8 +8,10 @@ import itertools as it
 import pickle
 import argparse
 import time
-import pysam
+import mh
 import multiprocessing as mp
+try:    import pysam           #only used by read_fasta_chrom_pos below
+except ImportError: pysam = None
 from sklearn.experimental import enable_iterative_imputer
 from warnings import simplefilter
 from sklearn.exceptions import ConvergenceWarning
@@ -505,7 +507,9 @@ def vcf_reader(vcf_path,seqs=[str(x) for x in range(1,23)]+['X','Y'],
     cnv_pattern    = re.compile('\AnatorRD=|[;]natorRD=|[\s]natorRD=')
     cons_pattern   = re.compile('\ACONSENSUS=|[;]CONSENSUS=|[\s]CONSENSUS=')
     icn_pattern    = re.compile('\AICN=|[;]ICN=|[\s]ICN=')
-    with open(vcf_path,'r') as f: #raw = [row.replace('\n','').split('\t') for row in f.readlines()]
+    if vcf_path.endswith('.gz'): f = gzip.open(vcf_path,'rt')
+    else:                        f = open(vcf_path,'r')
+    with f: #raw = [row.replace('\n','').split('\t') for row in f.readlines()]
         for line in f:
             row = line.replace('\n','').split('\t')
             if line.startswith('#'): header += [row]
@@ -695,25 +699,36 @@ def vcam_f1_sm_average(VS,v1,v2,svtypes=['DEL','DUP','INV','INS'],over=0.5):
         m[svtype] = np.mean(m[svtype])
     return M,m
 
-def vcf_to_vcam(sample_path,out_dir,sids,seqs,sv_types,add_chr=True,verbose=False):
+def vcf_to_vcam(sample_path,out_dir,sids,seqs,sv_types,add_chr=True,verbose=False,
+                ref_path=None,mh_flank=mh.MH_FLANK,mh_tol=mh.MH_TOL):
     if verbose: print('working on sample_path=%s'%sample_path)
-    vcf_paths = {int(path.split('_S')[-1].split('.vcf')[0]):path for path in glob.glob(sample_path+'/*.vcf')}
-    sample = sample_path.split('/')[-1]
+    vcf_paths = {int(path.split('_S')[-1].split('.vcf')[0]):path
+                 for path in glob.glob(sample_path+'/*.vcf')+glob.glob(sample_path+'/*.vcf.gz')}
+    sample    = sample_path.split('/')[-1]
+    vcam_path = out_dir+'/vcam/%s%s.vcam.gz'%(sample,utils.mh_tag(ref_path))
     #-----------------------------------------------------------------------------------------
-    if not os.path.exists(out_dir+'/vcam/%s.vcam.gz'%sample):
+    if not os.path.exists(vcam_path):
         if not os.path.exists(out_dir+'/vcam'): os.mkdir(out_dir+'/vcam')
         V = {sample:{}}
         for sid in vcf_paths:
             if sid in sids:
                 if verbose: print('reading:%s'%vcf_paths[sid])
                 V[sample][sid] = vcf_reader(vcf_paths[sid],seqs=seqs,sv_types=sv_types,add_chr=add_chr) #heavy lift here...
-        with gzip.GzipFile(out_dir+'/vcam/%s.vcam.gz'%sample,'wb') as f: pickle.dump(V,f)
+        #microhomology is scored once per sample here so that it travels inside the vcam------
+        if ref_path is not None:
+            mh.enrich_vcam_with_mh(V,ref_path,sv_types=sv_types,flank=mh_flank,tol=mh_tol,verbose=verbose)
+        with gzip.GzipFile(vcam_path,'wb') as f: pickle.dump(V,f)
     else:
-        with gzip.GzipFile(out_dir+'/vcam/%s.vcam.gz'%sample,'rb') as f: V = pickle.load(f)
+        with gzip.GzipFile(vcam_path,'rb') as f: V = pickle.load(f)
+        if ref_path is not None and not mh.vcam_has_mh(V): #vcam predates the mh feature
+            mh.enrich_vcam_with_mh(V,ref_path,sv_types=sv_types,flank=mh_flank,tol=mh_tol,verbose=verbose)
+            with gzip.GzipFile(vcam_path,'wb') as f: pickle.dump(V,f)
     #----------------------------------------------------------------------------------------
     return V
 
-def vcam_to_clust(V,out_dir,seqs,sv_sids,caller_pos=5,over=0.5,exclude_true=True,verbose=False):
+#caller_pos is negative so that the trailing (sid,idx) pair is picked up whatever the call
+#record carries in front of it, with or without the four values mh.enrich_vcam_with_mh adds
+def vcam_to_clust(V,out_dir,seqs,sv_sids,caller_pos=-2,over=0.5,exclude_true=True,verbose=False):
     sample = sorted(V)[0]
     if not os.path.exists(out_dir+'/clust/%s.clust.gz'%sample):
         if not os.path.exists(out_dir+'/clust'): os.mkdir(out_dir+'/clust')
@@ -762,18 +777,20 @@ def vcam_to_clust(V,out_dir,seqs,sv_sids,caller_pos=5,over=0.5,exclude_true=True
     #----------------------------------------------------------------------------------------
     return C
 
-def vcam_clust_to_chord(V,C,out_dir):
+def vcam_clust_to_chord(V,C,out_dir,ref_path=None):
     sample = sorted(V)[0]
     D = {sample:{}}
-    if not os.path.exists(out_dir+'/chord/%s.chord.gz'%sample):
+    chord_path = out_dir+'/chord/%s%s.chord.gz'%(sample,utils.mh_tag(ref_path))
+    if not os.path.exists(chord_path):
         if not os.path.exists(out_dir+'/chord'): os.mkdir(out_dir+'/chord')
         vs = get_sids_from_clust(C,sample)
+        mh_i = (mh.CHORD_POS if ref_path is not None and mh.vcam_has_mh(V) else None)
         for svtype in C[sample]:
             D[sample][svtype] = {}
             for seq in C[sample][svtype]:
                 M,X,L = [],[],[]
                 for c_idx in C[sample][svtype][seq]:
-                    x,m = utils.build_cluster_matrix(c_idx,V[sample],vs,svtype,seq)
+                    x,m = utils.build_cluster_matrix(c_idx,V[sample],vs,svtype,seq,mh_i=mh_i)
                     X += [x]
                     M += [m]
                 X = np.asarray(X,dtype=np.int32)   #chord coordinate/geno averages
@@ -784,9 +801,9 @@ def vcam_clust_to_chord(V,C,out_dir):
                 CL = list(C[sample][svtype][seq])
                 for i in x_idx: L += [CL[i]]
                 D[sample][svtype][seq] = {'chord':M,'v_idx':L,'u':X,'vs':vs[svtype]}
-        with gzip.GzipFile(out_dir+'/chord/%s.chord.gz'%sample,'wb') as f: pickle.dump(D,f)
+        with gzip.GzipFile(chord_path,'wb') as f: pickle.dump(D,f)
     else:
-        with gzip.GzipFile(out_dir+'/chord/%s.chord.gz'%sample,'rb') as f: D = pickle.load(f)
+        with gzip.GzipFile(chord_path,'rb') as f: D = pickle.load(f)
     return D
 
 def partition_true_chord(V,D,tid=0,t_over=0.5,geno_i=2,verbose=True):
@@ -936,7 +953,7 @@ def build_classifier_WY(WT,WD,Y,not_nan,nt_prop=4.0,scale_w=False,norm_w=True):
             W_[:,:,i] -= mu
             if std>0.0: W_[:,:,i] /= std
     else: W_ = np.concatenate([WT,WD_sampled])
-    W_ = W_.reshape(W_.shape[0],len(not_nan)*3)
+    W_ = W_.reshape(W_.shape[0],-1)
     Y_ = np.concatenate([Y[:,2],np.zeros((WD_sampled.shape[0],),dtype=np.int32)])
     r_idx   = np.random.choice(range(Y_.shape[0]),Y_.shape[0],replace=False)
     return W_[r_idx],Y_[r_idx]
@@ -1020,21 +1037,23 @@ def clear_w_index(W,index,random=True):
     WN[:,index,2] = 0.0 #zero out its decision...
     return WN.reshape(W.shape[0],W.shape[1])
 
-def tally_true_calls(W,P,Y,ensemble):
-    n = W.shape[1]//3
+def tally_true_calls(W,P,Y,ensemble,callers=None):
+    #callers is len(not_nan), the caller axis of W, so the feature width follows from W itself
+    n = (len(ensemble) if callers is None else callers)
+    f = W.shape[1]//n
     T,M = {caller:0 for caller in ensemble},{caller:0 for caller in ensemble}
     T['total'],M['total'] = 0,0
     for i in range(len(P)):
         if P[i]>0:
             if Y[i]>0:
-                calls = np.asarray(2*W[i].reshape((n,3)),dtype=int)[:,2]
+                calls = np.asarray(2*W[i].reshape((n,f)),dtype=int)[:,2]
                 for j in range(len(calls)):
                     if calls[j]>0:
                         if ensemble[j] in T: T[ensemble[j]] += 1
                         else:                T[ensemble[j]]  = 1
                 T['total'] += 1
         else:
-            calls = np.asarray(2*W[i].reshape((n,3)),dtype=int)[:,2]
+            calls = np.asarray(2*W[i].reshape((n,f)),dtype=int)[:,2]
             for j in range(len(calls)):
                 if calls[j]>0:
                     if ensemble[j] in M: M[ensemble[j]] += 1
@@ -1056,18 +1075,20 @@ def partition_chord_data(DS,svtype,imp,not_nan,sub_samples,sub_seqs):
                         y1 = np.asarray([chord_true(yy[i],x1[i]) for i in range(len(yy))],dtype=np.int32)
                         #imputation::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
                         m  = DS[sample][svtype][seq]['I']['chord']
-                        m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*3)
+                        f  = m.shape[2] #3 features per caller, 5 with mh_score and km_score
+                        m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*f)
                         if len(x1)>0:
-                            w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),3))
+                            w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),f))
                             XT += [x1]
                             WT += [w1]
                             Y  += [y1]
                     if 'D1' in DS[sample][svtype][seq]:
                         x1 = DS[sample][svtype][seq]['D1']['u']
                         m  = DS[sample][svtype][seq]['D1']['chord']
-                        m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*3)
+                        f  = m.shape[2]
+                        m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*f)
                         if len(x1)>0:
-                            w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),3))
+                            w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),f))
                             XD += [x1]
                             WD += [w1]
     if len(XT)>0: XT = np.concatenate(XT)
@@ -1087,9 +1108,10 @@ def preprocess_predict_data(DS,svtype,imp,not_nan,sub_samples,sub_seqs,scale_w=F
                     x1 = DS[sample][svtype][seq]['u']
                     #imputation:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
                     m  = DS[sample][svtype][seq]['chord']
-                    m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*3)
+                    f  = m.shape[2] #3 features per caller, 5 with mh_score and km_score
+                    m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*f)
                     if len(x1)>0:
-                        w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),3))
+                        w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),f))
                         XTD += [x1]
                         WTD += [w1]
     if len(XTD)>0: XTD = np.concatenate(XTD)
@@ -1117,8 +1139,11 @@ def preprocess_predict_data(DS,svtype,imp,not_nan,sub_samples,sub_seqs,scale_w=F
         _mag = int(1e6)-50
         W_[:,:,1] = (W_[:,:,1]-50)/_mag
         W_[:,:,2] /= 2.0
+        #column 3 is mh_score, already a rank in [0,1]. column 4 is km_score, log2 of a
+        #count, so it is put on the same scale as the rest rather than dominating the MLP
+        if W_.shape[2]>4: W_[:,:,4] /= mh.KM_SCALE
     else: W_ = WTD
-    W_ = W_.reshape(W_.shape[0],len(not_nan)*3)
+    W_ = W_.reshape(W_.shape[0],-1)
     return W_
 
 def print_call_hist(C,min_len=50,max_len=int(1e6)):
@@ -1194,6 +1219,16 @@ if __name__ == '__main__':
     parser.add_argument('--pred_dirs',type=str, help='predict directory to call new VCFs from using models\t[None]')
     parser.add_argument('--seqs',type=str,help='comma seperated chrom listing\t[taken from VCF files..]')
     parser.add_argument('--sv_mask',type=str,help='BED3/6 format of excluded regions (pre-merge)\t[None]')
+    ref_des = """indexed reference FASTA that turns on the two sequence features scored at every
+    caller breakpoint: mh_score, the exact microhomology the junction sits on, and km_score, the
+    k-mers the two breakpoint neighborhoods share. the chord grows from 3 per caller columns to
+    5, so this changes the shape of the models and those runs cache into vcam/chord/train/models
+    files tagged .mh that never mix with the plain ones. worth +0.0184 DEL f1 on hgsv2/GRCh38,
+    0.8012 to 0.8196, 95%% CI [+0.0172,+0.0196]\t[None, both features off]
+    """
+    parser.add_argument('--ref',type=str,help=ref_des)
+    parser.add_argument('--mh_flank',type=int,help='bp scanned each side of a breakpoint for MH\t[10]')
+    parser.add_argument('--mh_tol',type=int,help='bp of breakpoint imprecision allowed when reading MH\t[2]')
     parser.add_argument('--sv_types',type=str,help='comma seperated sv types\t[DEL,DUP,INV,INS]')
     stage_map_des = """JSON map of caller ids to stage names (and back):
     stage_map_json_file -> {0:'True',4:'BreakDancer',8:'CNVpytor',9:'ERDS',10:'CNVnator',11:'Delly2',13:'GATK',
@@ -1232,6 +1267,17 @@ if __name__ == '__main__':
     else:                         seqs = None #need to get from the inputs...
     if args.sv_mask is not None:  sv_mask = args.sv_mask
     else:                         sv_mask = {}
+    if args.ref is not None:
+        ref_path = args.ref
+        if not os.path.exists(ref_path): print('reference was not found: %s'%ref_path); raise IOError
+        print('microhomology enabled, scoring breakpoints against %s'%ref_path)
+    else:
+        ref_path = None
+        print('no --ref given, microhomology is off and the chord stays center,span,geno')
+    if args.mh_flank is not None: mh_flank = args.mh_flank
+    else:                         mh_flank = mh.MH_FLANK
+    if args.mh_tol is not None:   mh_tol   = args.mh_tol
+    else:                         mh_tol   = mh.MH_TOL
     if args.sv_types is not None: sv_types = args.sv_types.split(',')
     else:                         sv_types = ['DEL','DUP','INV','INS']
     if args.stage_map is not None:
@@ -1286,24 +1332,33 @@ if __name__ == '__main__':
     test_samples  = [sm.split('/')[-1] for sm in test_samples]
     valid_samples = [sm.split('/')[-1] for sm in valid_samples]
 
+    #the MH background is built once here, before the pool starts, and cached next to the
+    #reference: every worker then just reads it instead of resampling the same arms
+    if ref_path is not None:
+        bg_start = time.time()
+        bg = mh.load_background(ref_path,chroms=seqs,flank=mh_flank,tol=mh_tol,verbose=True)
+        print('mh: background ready over %s arms in %s min(s)'%(len(bg.dist),round((time.time()-bg_start)/60,2)))
+
     partitions = [[] for i in range(cpus)]
     for i in range(len(samples)): partitions[i%cpus] += [samples[i]]
-    DS,CS,VS = utils.process_prepare_training_samples(out_dir,partitions,seqs,sv_types,sids,sv_sids) #test out ||
+    DS,CS,VS = utils.process_prepare_training_samples(out_dir,partitions,seqs,sv_types,sids,sv_sids,
+                                                      ref_path=ref_path,mh_flank=mh_flank,mh_tol=mh_tol) #test out ||
 
     IM = {}
     print('starting chord imputation via center/span regression...')
     #----------------------------------------------------------------------------------------------------------
     for svtype in sorted(sv_types):
         if not os.path.exists(out_dir+'/models'): os.mkdir(out_dir+'/models')
-        if not os.path.exists(out_dir+'/models/%s.imp.pickle'%svtype):
-            print('did not find [%s.imp.pickle] model, imputing...'%svtype)
+        imp_path = out_dir+'/models/%s%s.imp.pickle'%(svtype,utils.mh_tag(ref_path))
+        if not os.path.exists(imp_path):
+            print('did not find [%s] model, imputing...'%imp_path.split('/')[-1])
             imp,not_nan = build_multi_imputer(DS,train_samples,train_seqs,svtype,n_jobs=cpus) #make one pass at imputation...
             IM[svtype] = {'imp':imp,'not_nan':not_nan}
-            with open(out_dir+'/models/%s.imp.pickle'%svtype,'wb') as f:
+            with open(imp_path,'wb') as f:
                 pickle.dump({'imp':IM[svtype]['imp'],'not_nan':IM[svtype]['not_nan']},f)
         else:
-            print('found [%s.imp.pickle] model, loading...'%svtype)
-            with open(out_dir+'/models/%s.imp.pickle'%svtype,'rb') as f:
+            print('found [%s] model, loading...'%imp_path.split('/')[-1])
+            with open(imp_path,'rb') as f:
                 IM[svtype] = pickle.load(f) #IM[svtype]['imp'], IM[svtype]['not_nan']
 
     start = time.time()
@@ -1329,10 +1384,11 @@ if __name__ == '__main__':
             if pred.split('/')[-1] in valid_samples: ps += [pred]
             #ps += [pred]
         pred_samples = sorted(ps)
-        DS,CS,VS = utils.worker_prepare_prediction_samples(out_dir,pred_samples,seqs,sv_types,sids,sv_sids,c_over)
+        DS,CS,VS = utils.worker_prepare_prediction_samples(out_dir,pred_samples,seqs,sv_types,sids,sv_sids,c_over,
+                                                           ref_path,mh_flank,mh_tol)
         IM = {}
         for svtype in sv_types:
-            with open(out_dir+'/models/%s.imp.pickle'%svtype,'rb') as f:
+            with open(out_dir+'/models/%s%s.imp.pickle'%(svtype,utils.mh_tag(ref_path)),'rb') as f:
                 IM[svtype] = pickle.load(f)
 
         #work through each sample, svtype, and seq to retireve the information to make a VCF

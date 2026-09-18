@@ -8,8 +8,10 @@ import itertools as it
 import pickle
 import argparse
 import time
-import pysam
+import mh
 import multiprocessing as mp
+try:    import pysam           #only used by read_fasta_chrom_pos below
+except ImportError: pysam = None
 from sklearn.experimental import enable_iterative_imputer
 from warnings import simplefilter
 from sklearn.exceptions import ConvergenceWarning
@@ -247,7 +249,9 @@ def vcf_reader(vcf_path,seqs=[str(x) for x in range(1,23)]+['X','Y'],
     cnv_pattern    = re.compile('\AnatorRD=|[;]natorRD=|[\s]natorRD=')
     cons_pattern   = re.compile('\ACONSENSUS=|[;]CONSENSUS=|[\s]CONSENSUS=')
     icn_pattern    = re.compile('\AICN=|[;]ICN=|[\s]ICN=')
-    with open(vcf_path,'r') as f: #raw = [row.replace('\n','').split('\t') for row in f.readlines()]
+    if vcf_path.endswith('.gz'): f = gzip.open(vcf_path,'rt')
+    else:                        f = open(vcf_path,'r')
+    with f: #raw = [row.replace('\n','').split('\t') for row in f.readlines()]
         for line in f:
             row = line.replace('\n','').split('\t')
             if line.startswith('#'): header += [row]
@@ -327,25 +331,42 @@ def vcf_reader(vcf_path,seqs=[str(x) for x in range(1,23)]+['X','Y'],
         for seq in D[svtype]: D[svtype][seq] = sorted(D[svtype][seq],key=lambda x: x[0])
     return D
 
-def vcf_to_vcam(sample_path,out_dir,sids,seqs,sv_types,add_chr=True,verbose=False):
+def mh_tag(ref_path):
+    #MH bearing vcam/chord/train/model files are cached apart from plain ones so that a run
+    #with a reference can never pick up a stale 3 wide chord left by a run without one, or
+    #the other way round
+    return ('' if ref_path is None else '.mh')
+
+def vcf_to_vcam(sample_path,out_dir,sids,seqs,sv_types,add_chr=True,verbose=False,
+                ref_path=None,mh_flank=mh.MH_FLANK,mh_tol=mh.MH_TOL):
     if verbose: print('working on sample_path=%s'%sample_path)
-    vcf_paths = {int(path.split('_S')[-1].split('.vcf')[0]):path for path in glob.glob(sample_path+'/*.vcf')}
-    sample = sample_path.split('/')[-1]
+    vcf_paths = {int(path.split('_S')[-1].split('.vcf')[0]):path
+                 for path in glob.glob(sample_path+'/*.vcf')+glob.glob(sample_path+'/*.vcf.gz')}
+    sample    = sample_path.split('/')[-1]
+    vcam_path = out_dir+'/vcam/%s%s.vcam.gz'%(sample,mh_tag(ref_path))
     #-----------------------------------------------------------------------------------------
-    if not os.path.exists(out_dir+'/vcam/%s.vcam.gz'%sample):
+    if not os.path.exists(vcam_path):
         if not os.path.exists(out_dir+'/vcam'): os.mkdir(out_dir+'/vcam')
         V = {sample:{}}
         for sid in vcf_paths:
             if sid in sids:
                 if verbose: print('reading:%s'%vcf_paths[sid])
                 V[sample][sid] = vcf_reader(vcf_paths[sid],seqs=seqs,sv_types=sv_types,add_chr=add_chr) #heavy lift here...
-        with gzip.GzipFile(out_dir+'/vcam/%s.vcam.gz'%sample,'wb') as f: pickle.dump(V,f)
+        #microhomology is scored once per sample here so that it travels inside the vcam------
+        if ref_path is not None:
+            mh.enrich_vcam_with_mh(V,ref_path,sv_types=sv_types,flank=mh_flank,tol=mh_tol,verbose=verbose)
+        with gzip.GzipFile(vcam_path,'wb') as f: pickle.dump(V,f)
     else:
-        with gzip.GzipFile(out_dir+'/vcam/%s.vcam.gz'%sample,'rb') as f: V = pickle.load(f)
+        with gzip.GzipFile(vcam_path,'rb') as f: V = pickle.load(f)
+        if ref_path is not None and not mh.vcam_has_mh(V): #vcam predates the mh feature
+            mh.enrich_vcam_with_mh(V,ref_path,sv_types=sv_types,flank=mh_flank,tol=mh_tol,verbose=verbose)
+            with gzip.GzipFile(vcam_path,'wb') as f: pickle.dump(V,f)
     #----------------------------------------------------------------------------------------
     return V
 
-def vcam_to_clust(V,out_dir,seqs,sv_sids,caller_pos=5,over=0.5,exclude_true=True,verbose=False):
+#caller_pos is negative so that the trailing (sid,idx) pair is picked up whatever the call
+#record carries in front of it, with or without the four values mh.enrich_vcam_with_mh adds
+def vcam_to_clust(V,out_dir,seqs,sv_sids,caller_pos=-2,over=0.5,exclude_true=True,verbose=False):
     sample = sorted(V)[0]
     if not os.path.exists(out_dir+'/clust/%s.clust.gz'%sample):
         if not os.path.exists(out_dir+'/clust'): os.mkdir(out_dir+'/clust')
@@ -394,19 +415,21 @@ def vcam_to_clust(V,out_dir,seqs,sv_sids,caller_pos=5,over=0.5,exclude_true=True
     #----------------------------------------------------------------------------------------
     return C
 
-def vcam_clust_to_chord(V,C,out_dir):
+def vcam_clust_to_chord(V,C,out_dir,ref_path=None):
     sample = sorted(V)[0]
     D = {sample:{}}
-    if not os.path.exists(out_dir+'/chord/%s.chord.gz'%sample):
+    chord_path = out_dir+'/chord/%s%s.chord.gz'%(sample,mh_tag(ref_path))
+    if not os.path.exists(chord_path):
         if not os.path.exists(out_dir+'/chord'): os.mkdir(out_dir+'/chord')
         vs = get_sids_from_clust(C,sample)
         print(vs)
+        mh_i = (mh.CHORD_POS if ref_path is not None and mh.vcam_has_mh(V) else None)
         for svtype in C[sample]:
             D[sample][svtype] = {}
             for seq in C[sample][svtype]:
                 M,X,L = [],[],[]
                 for c_idx in C[sample][svtype][seq]:
-                    x,m = build_cluster_matrix(c_idx,V[sample],vs,svtype,seq)
+                    x,m = build_cluster_matrix(c_idx,V[sample],vs,svtype,seq,mh_i=mh_i)
                     X += [x]
                     M += [m]
                 X = np.asarray(X,dtype=np.int32)   #chord coordinate/geno averages
@@ -417,30 +440,40 @@ def vcam_clust_to_chord(V,C,out_dir):
                 CL = list(C[sample][svtype][seq])
                 for i in x_idx: L += [CL[i]]
                 D[sample][svtype][seq] = {'chord':M,'v_idx':L,'u':X,'vs':vs[svtype]}
-        with gzip.GzipFile(out_dir+'/chord/%s.chord.gz'%sample,'wb') as f: pickle.dump(D,f)
+        with gzip.GzipFile(chord_path,'wb') as f: pickle.dump(D,f)
     else:
-        with gzip.GzipFile(out_dir+'/chord/%s.chord.gz'%sample,'rb') as f: D = pickle.load(f)
+        with gzip.GzipFile(chord_path,'rb') as f: D = pickle.load(f)
     return D
 
-def build_cluster_matrix(c_idx,V,vs,svtype,seq,geno_i=2):
+def build_cluster_matrix(c_idx,V,vs,svtype,seq,geno_i=2,mh_i=None):
+    #mh_i is a list of positions inside a call record to carry as extra per caller features,
+    #normally mh.CHORD_POS = [mh_score,km_score]. without it each caller contributes
+    #center,span,geno as before. the cluster representative u stays three wide since it
+    #carries coordinates rather than features
+    if mh_i is None:           feats = []
+    elif hasattr(mh_i,'__len__'): feats = list(mh_i)
+    else:                      feats = [mh_i]
     U,M,cs = {},{},[idx[0] for idx in c_idx]
-    for idx in c_idx: U[idx[0]] = V[idx[0]][svtype][seq][idx[1]][:(geno_i+1)]
-    u = np.mean(np.asarray([U[x] for x in U],dtype=np.float32),axis=0)
-    u[2] = np.median([U[x][2] for x in U])
+    for idx in c_idx: U[idx[0]] = V[idx[0]][svtype][seq][idx[1]]
+    u = np.mean(np.asarray([U[x][:(geno_i+1)] for x in U],dtype=np.float32),axis=0)
+    u[2] = np.median([U[x][geno_i] for x in U])
     u_span   = np.float32(abs(u[0]-u[1])+1)
     u_center = np.float32(u[0]+(u_span//2+1))
     for sid in vs[svtype]:
         if sid in cs:
             s_span   = abs(U[sid][0]-U[sid][1])+1
             s_center = (U[sid][0]+s_span//2+1)-u_center
-            M[sid] = [s_center,s_span,U[sid][2]]
-        else:         M[sid] = [np.nan,np.nan,0]
+            M[sid] = [s_center,s_span,U[sid][geno_i]]
+            M[sid] += [(U[sid][i] if len(U[sid])>i else np.nan) for i in feats]
+        else:
+            M[sid] = [np.nan,np.nan,0]+[np.nan for i in feats]
     return [np.int32(round(i)) for i in u],np.asarray([M[sid] for sid in sorted(M)],dtype=np.float32)
 
-def partition_true_chord(V,D,out_dir,tid=0,t_over=0.5,geno_i=2,verbose=True):
+def partition_true_chord(V,D,out_dir,tid=0,t_over=0.5,geno_i=2,verbose=True,ref_path=None):
     sample = sorted(D)[0]
     P = {sample:{}}
-    if not os.path.exists(out_dir+'/train/%s.train.gz'%sample):
+    train_path = out_dir+'/train/%s%s.train.gz'%(sample,mh_tag(ref_path))
+    if not os.path.exists(train_path):
         if not os.path.exists(out_dir+'/train'): os.mkdir(out_dir+'/train')
         for svtype in D[sample]:
             n,m,a = 0,0,0
@@ -474,9 +507,9 @@ def partition_true_chord(V,D,out_dir,tid=0,t_over=0.5,geno_i=2,verbose=True):
                 if prec>0 or rec>0:   f1 = 2*(prec*rec)/(prec+rec)
                 print('%s: prec=%s,rec=%s,f1=%s for sample=%s'%\
                               (svtype,round(prec,2),round(rec,2),round(f1,2),sample))
-            with gzip.GzipFile(out_dir+'/train/%s.train.gz'%sample,'wb') as f: pickle.dump(P,f)
+            with gzip.GzipFile(train_path,'wb') as f: pickle.dump(P,f)
     else:
-        with gzip.GzipFile(out_dir+'/train/%s.train.gz'%sample,'rb') as f: P = pickle.load(f)
+        with gzip.GzipFile(train_path,'rb') as f: P = pickle.load(f)
     return P
 
 def partition_chord_data(DS,svtype,imp,not_nan,sub_samples,sub_seqs):
@@ -492,18 +525,20 @@ def partition_chord_data(DS,svtype,imp,not_nan,sub_samples,sub_seqs):
                             y1 = np.asarray([chord_true(yy[i],x1[i]) for i in range(len(yy))],dtype=np.int32)
                             #imputation::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
                             m  = DS[sample][svtype][seq]['I']['chord']
-                            m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*3)
+                            f  = m.shape[2] #3 features per caller, 5 with mh_score and km_score
+                            m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*f)
                             if len(x1)>0:
-                                w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),3))
+                                w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),f))
                                 XT += [x1]
                                 WT += [w1]
                                 Y  += [y1]
                         if 'D1' in DS[sample][svtype][seq]:
                             x1 = DS[sample][svtype][seq]['D1']['u']
                             m  = DS[sample][svtype][seq]['D1']['chord']
-                            m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*3)
+                            f  = m.shape[2]
+                            m  = m[:,not_nan,:].reshape(m.shape[0],len(not_nan)*f)
                             if len(x1)>0:
-                                w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),3))
+                                w1 = np.int32(imp.transform(m).reshape(m.shape[0],len(not_nan),f))
                                 XD += [x1]
                                 WD += [w1]
     if len(XT)>0: XT = np.concatenate(XT)
@@ -568,21 +603,23 @@ def basic_score(y,p,w=1.0): #no genotyping here...
         #do jaccard_1D..................
     return prec,rec,f1,w1
 
-def tally_true_calls(W,P,Y,ensemble):
-    n = W.shape[1]//3
+def tally_true_calls(W,P,Y,ensemble,callers=None):
+    #callers is len(not_nan), the caller axis of W, so the feature width follows from W itself
+    n = (len(ensemble) if callers is None else callers)
+    f = W.shape[1]//n
     T,M = {caller:0 for caller in ensemble},{caller:0 for caller in ensemble}
     T['total'],M['total'] = 0,0
     for i in range(len(P)):
         if P[i]>0:
             if Y[i]>0:
-                calls = np.asarray(2*W[i].reshape((n,3)),dtype=int)[:,2]
+                calls = np.asarray(2*W[i].reshape((n,f)),dtype=int)[:,2]
                 for j in range(len(calls)):
                     if calls[j]>0:
                         if ensemble[j] in T: T[ensemble[j]] += 1
                         else:                T[ensemble[j]]  = 1
                 T['total'] += 1
         else:
-            calls = np.asarray(2*W[i].reshape((n,3)),dtype=int)[:,2]
+            calls = np.asarray(2*W[i].reshape((n,f)),dtype=int)[:,2]
             for j in range(len(calls)):
                 if calls[j]>0:
                     if ensemble[j] in M: M[ensemble[j]] += 1
@@ -618,8 +655,11 @@ def build_classifier_WY(WT,WD,Y,not_nan,nt_prop=4.0,scale_w=False,norm_w=False,h
         _mag = int(1e6)-50
         W_[:,:,1] = (W_[:,:,1]-50)/_mag
         W_[:,:,2] /= 2.0
+        #column 3 is mh_score, already a rank in [0,1]. column 4 is km_score, log2 of a
+        #count, so it is put on the same scale as the rest rather than dominating the MLP
+        if W_.shape[2]>4: W_[:,:,4] /= mh.KM_SCALE
     else: W_ = np.concatenate([WT,WD_sampled])
-    W_ = W_.reshape(W_.shape[0],len(not_nan)*3)
+    W_ = W_.reshape(W_.shape[0],-1)
     Y_ = np.concatenate([Y[:,2],np.zeros((WD_sampled.shape[0],),dtype=np.int32)])
     r_idx   = np.random.choice(range(Y_.shape[0]),Y_.shape[0],replace=False)
     return W_[r_idx],Y_[r_idx]
@@ -676,7 +716,8 @@ def worker_train_classifier(out_dir,DS,IM,sids,svtype,train_samples,test_samples
                     score[svtype]['m']     = sum(P_test)
                     score[svtype]['prop']  = prop
                     ensemble = vs[svtype]
-                    score[svtype]['factors'] = tally_true_calls(W_test,model.predict(W_test),Y_test,ensemble)['T']
+                    score[svtype]['factors'] = tally_true_calls(W_test,model.predict(W_test),Y_test,ensemble,
+                                                                len(IM[svtype]['not_nan']))['T']
                     #calculate the contribution for this new model using its training WT1,Y1 yields...
         # #12/18/22 models are DEL@ 0.63 >0.54(old), DUP@ 0.27 >0.19(old), INV@ 0.76 >0.45(old)---------------------
         # #FusorSV notes: best DEL f1 is Lumpy @ 0.54, FusorSV INV f1 is @ 0.45, FusorSV DUP is @ 0.16 < (GS was 0.19)
@@ -709,16 +750,19 @@ def process_train_classifier(out_dir,DS,IM,sids,sv_types,train_samples,test_samp
         print(score[svtype])
     return score
 
-def worker_prepare_training_samples(out_dir,samples,seqs,sv_types,sids,cluster_sids,cluster_over,true_over):
+def worker_prepare_training_samples(out_dir,samples,seqs,sv_types,sids,cluster_sids,cluster_over,true_over,
+                                    ref_path=None,mh_flank=mh.MH_FLANK,mh_tol=mh.MH_TOL):
     DS,CS,VS = {},{},{}
     for sample_path in sorted(samples): #can do this in ||
         sample = sample_path.split('/')[-1]
-        VS[sample] = vcf_to_vcam(sample_path,out_dir,sids,seqs,sv_types,verbose=True)
+        VS[sample] = vcf_to_vcam(sample_path,out_dir,sids,seqs,sv_types,verbose=True,
+                                 ref_path=ref_path,mh_flank=mh_flank,mh_tol=mh_tol)
         CS[sample] = vcam_to_clust(VS[sample],out_dir,seqs,cluster_sids,over=cluster_over,verbose=True)
-        DS[sample] = vcam_clust_to_chord(VS[sample],CS[sample],out_dir)
-        DS[sample] = partition_true_chord(VS[sample],DS[sample],out_dir,t_over=true_over)[sample]
+        DS[sample] = vcam_clust_to_chord(VS[sample],CS[sample],out_dir,ref_path=ref_path)
+        DS[sample] = partition_true_chord(VS[sample],DS[sample],out_dir,t_over=true_over,ref_path=ref_path)[sample]
         CS[sample] = CS[sample][sample]
         VS[sample] = VS[sample][sample]
+    mh.close_references()
     for svtype in sv_types: #check to ensure all callers are harmonized
         min_vs,max_vs = get_min_max_vs(DS,svtype)
         if min_vs!=max_vs: #expansion is needed-----------------------------------
@@ -752,15 +796,18 @@ def worker_prepare_training_samples(out_dir,samples,seqs,sv_types,sids,cluster_s
                                 DS[sm][svtype][seq]['D1']['vs']    = max_vs
     return [DS,CS,VS]
 
-def worker_prepare_prediction_samples(out_dir,samples,seqs,sv_types,sids,cluster_sids,cluster_over):
+def worker_prepare_prediction_samples(out_dir,samples,seqs,sv_types,sids,cluster_sids,cluster_over,
+                                      ref_path=None,mh_flank=mh.MH_FLANK,mh_tol=mh.MH_TOL):
     DS,CS,VS = {},{},{}
     for sample_path in sorted(samples): #can do this in ||
         sample = sample_path.split('/')[-1]
-        VS[sample] = vcf_to_vcam(sample_path,out_dir,sids,seqs,sv_types,verbose=True)
+        VS[sample] = vcf_to_vcam(sample_path,out_dir,sids,seqs,sv_types,verbose=True,
+                                 ref_path=ref_path,mh_flank=mh_flank,mh_tol=mh_tol)
         CS[sample] = vcam_to_clust(VS[sample],out_dir,seqs,cluster_sids,over=cluster_over,verbose=True)
-        DS[sample] = vcam_clust_to_chord(VS[sample],CS[sample],out_dir)[sample]
+        DS[sample] = vcam_clust_to_chord(VS[sample],CS[sample],out_dir,ref_path=ref_path)[sample]
         CS[sample] = CS[sample][sample]
         VS[sample] = VS[sample][sample]
+    mh.close_references()
     for svtype in sv_types: #check to ensure all callers are harmonized
         min_vs,max_vs = get_min_max_vs(DS,svtype)
         if min_vs!=max_vs: #expansion is needed-----------------------------------
@@ -781,12 +828,13 @@ def worker_prepare_prediction_samples(out_dir,samples,seqs,sv_types,sids,cluster
                             DS[sm][svtype][seq]['vs']    = max_vs
     return [DS,CS,VS]
 
-def process_prepare_training_samples(out_dir,partitions,seqs,sv_types,sids,cluster_sids,cluster_over=0.75,true_over=0.5,cpus=12):
+def process_prepare_training_samples(out_dir,partitions,seqs,sv_types,sids,cluster_sids,cluster_over=0.75,true_over=0.5,cpus=12,
+                                    ref_path=None,mh_flank=mh.MH_FLANK,mh_tol=mh.MH_TOL):
     global result_list
     p2 = mp.Pool(processes=cpus)
     for samples in partitions: #each will be 1 to n number of samples to process one at a time, #partitions is || factor
         p2.apply_async(worker_prepare_training_samples,
-                       args=(out_dir,samples,seqs,sv_types,sids,cluster_sids,cluster_over,true_over),
+                       args=(out_dir,samples,seqs,sv_types,sids,cluster_sids,cluster_over,true_over,ref_path,mh_flank,mh_tol),
                        callback=collect_results)
         time.sleep(0.5)
     p2.close()
