@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+
+#reference genomes and their indexes: large, and they belong outside the repo
+*.fa
+*.fasta
+*.fna
+*.fa.gz
+*.fai
+*.gzi
+GRCh38_genome.zip
+
+#the MH background model, rebuilt from the reference on demand
+*.mhbg.*.pickle
+
+#run output: vcam, clust, chord, train, models and called vcfs
+*.vcam.gz
+*.clust.gz
+*.chord.gz
+*.train.gz
+*.imp.pickle
+*.model.pickle
